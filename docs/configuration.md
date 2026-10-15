@@ -2708,6 +2708,33 @@ supported on the current platform.
     </tr>
 </table>
 
+### qsv_async_depth
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Number of frames the QuickSync encoder is allowed to keep in flight.
+            @note{This option only applies when using quicksync [encoder](#encoder).}
+            @caution{The default of 1 matches upstream Sunshine. Larger values increase throughput but
+            also add in-flight latency, and Sunshine's parameter-set injection and IDR handling were
+            written assuming the default. Only change this for a latency investigation.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            1
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            qsv_async_depth = 1
+            @endcode</td>
+    </tr>
+</table>
+
 ## AMD AMF Encoder
 
 ### amd_usage

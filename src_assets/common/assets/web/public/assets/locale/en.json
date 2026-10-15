@@ -389,6 +389,8 @@
     "qsv_preset_veryfast": "fastest (lowest quality)",
     "qsv_slow_hevc": "Allow Slow HEVC Encoding",
     "qsv_slow_hevc_desc": "This can enable HEVC encoding on older Intel GPUs, at the cost of higher GPU usage and worse performance.",
+    "qsv_async_depth": "QuickSync Async Depth",
+    "qsv_async_depth_desc": "Number of frames the QuickSync encoder keeps in flight. Diagnostic option: the default of 1 matches upstream, and higher values buy throughput at the cost of added latency.",
     "restart_note": "Sunshine is restarting to apply changes.",
     "search_options": "Search configuration options...",
     "stream_audio": "Stream Audio",

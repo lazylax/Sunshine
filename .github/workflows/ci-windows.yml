@@ -334,6 +334,12 @@ jobs:
 
       - name: Run tests
         id: test
+        # diag branch: keep the artifact independent of test outcomes. "Upload Artifacts" below has no
+        # "if: always()", so one failing test skips it and costs a full 45-90 minute rebuild on a runner
+        # with no ccache. The first diag run failed ONLY ConfigConsistencyTest (an undocumented config
+        # option) after Build Windows and Check Windows linkage had both succeeded. A failing test is
+        # still reported in the job summary and log; it just no longer withholds the binary.
+        continue-on-error: true
         shell: msys2 {0}
         working-directory: build/tests
         run: ./test_sunshine.exe --gtest_color=yes --gtest_output=xml:test_results.xml
