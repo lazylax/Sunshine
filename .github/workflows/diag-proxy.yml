@@ -61,3 +61,46 @@ jobs:
             tools/mfxproxy/mfxhook.dll
             tools/mfxproxy/exports.txt
           if-no-files-found: error
+
+  # An independent DXGI Desktop Duplication present-rate meter. The desktop-cadence numbers so far came
+  # either through Sunshine (which owns the display mode) or through ffmpeg's ddagrab (whose dup_frames
+  # default pads the output and once made a 60 Hz mode report 119 fps), so a purpose-built meter with no
+  # padding and no other client is needed to settle what the desktop really does.
+  dxgidup:
+    name: dxgidup (Windows x64)
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Locate MSVC
+        id: msvc
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS=%%i"
+          if not defined VS exit /b 1
+          echo vcvars=%VS%\VC\Auxiliary\Build\vcvars64.bat>>"%GITHUB_OUTPUT%"
+
+      - name: Build dxgidup.exe
+        shell: cmd
+        run: |
+          call "${{ steps.msvc.outputs.vcvars }}"
+          cd tools\dxgidup
+          cl /nologo /O2 /W3 /EHsc /Fe:dxgidup.exe dxgidup.cpp /link dxgi.lib d3d11.lib
+          if errorlevel 1 exit /b 1
+          dir dxgidup.exe
+
+      - name: Smoke test (lists this runner's outputs; must not crash)
+        shell: cmd
+        run: |
+          call "${{ steps.msvc.outputs.vcvars }}"
+          cd tools\dxgidup
+          dxgidup.exe --seconds 1
+          exit /b 0
+
+      - name: Upload dxgidup
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxgidup
+          path: tools/dxgidup/dxgidup.exe
+          if-no-files-found: error
