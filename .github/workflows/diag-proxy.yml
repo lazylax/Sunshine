@@ -1,11 +1,12 @@
 name: diag-mfx-proxy
 
-# Builds tools/mfxproxy: a tiny timing shim that is loaded in place of Intel's oneVPL dispatcher so
-# the time ffmpeg spends inside avcodec_send_frame() can be split into MFXVideoENCODE_EncodeFrameAsync
-# (submit / wait for a free surface) and MFXVideoCORE_SyncOperation (wait for the GPU).
+# Builds tools/mfxproxy/mfxhook.dll: a DLL that is *injected* into sunshine.exe and times the two MFX
+# calls that make up avcodec_send_frame() (MFXVideoENCODE_EncodeFrameAsync = submit,
+# MFXVideoCORE_SyncOperation = wait for the GPU). It hooks the host process's GetProcAddress import, so
+# it needs no export table of its own and no file is replaced on the target machine.
 #
-# Lives on its own branch and its own workflow so a proxy build failure can never withhold the
-# diagnostic Sunshine binary produced by diag-windows.yml.
+# Lives on its own branch and workflow so a failure here can never withhold the diagnostic Sunshine
+# binary produced by diag-windows.yml.
 
 on:
   push:
@@ -15,7 +16,7 @@ on:
 
 jobs:
   proxy:
-    name: mfxproxy (Windows x64)
+    name: mfxhook (Windows x64)
     runs-on: windows-2022
     steps:
       - name: Checkout
@@ -27,35 +28,33 @@ jobs:
         run: |
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS=%%i"
           if not defined VS exit /b 1
-          echo %VS%\VC\Auxiliary\Build\vcvars64.bat>"%TEMP%\vcvars.txt"
-          type "%TEMP%\vcvars.txt"
           echo vcvars=%VS%\VC\Auxiliary\Build\vcvars64.bat>>"%GITHUB_OUTPUT%"
+          type "%GITHUB_OUTPUT%"
 
-      - name: Build libvpl.dll proxy
+      - name: Build mfxhook.dll
         shell: cmd
         run: |
           call "${{ steps.msvc.outputs.vcvars }}"
           cd tools\mfxproxy
-          cl /nologo /LD /O2 /W3 /Fe:libvpl.dll mfxproxy.c /link /DEF:libvpl.def
+          cl /nologo /LD /O2 /W3 /Fe:mfxhook.dll mfxhook.c
           if errorlevel 1 exit /b 1
-          dumpbin /exports libvpl.dll > exports.txt
-          echo ---- exported symbol count ----
-          find /c "MFX" exports.txt
+          dir mfxhook.dll
 
-      - name: Verify that every forward target and the two shims are present
+      - name: Confirm the DLL exports nothing (it only hooks the host's IAT)
         shell: cmd
         run: |
           call "${{ steps.msvc.outputs.vcvars }}"
           cd tools\mfxproxy
-          dumpbin /exports libvpl.dll | findstr /c:"MFXVideoENCODE_EncodeFrameAsync" /c:"MFXVideoCORE_SyncOperation" /c:"libvpl_real.MFXLoad" /c:"libvpl_real.MFXVideoVPP_Init" > found.txt
-          type found.txt
-          find /c "libvpl_real." found.txt
+          dumpbin /exports mfxhook.dll > exports.txt
+          type exports.txt
+          findstr /c:"MFXVideoENCODE_EncodeFrameAsync" exports.txt && exit /b 1
+          echo no MFX exports, as intended
 
-      - name: Upload proxy
+      - name: Upload mfxhook
         uses: actions/upload-artifact@v4
         with:
           name: mfx-proxy
           path: |
-            tools/mfxproxy/libvpl.dll
+            tools/mfxproxy/mfxhook.dll
             tools/mfxproxy/exports.txt
           if-no-files-found: error
