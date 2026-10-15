@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <cmath>
+#include <cstdlib>
 #include <thread>
 
 // platform includes
@@ -363,8 +364,26 @@ namespace platf::dxgi {
           // To avoid starving the encoding thread, sleep without the lock held for a little
           // while each time we reach our max frame timeout. This will only happen when nothing
           // is updating the display, so no visible stutter should be introduced by the sleep.
+          // syslat: the 10ms anti-starvation sleep is the leading candidate for capping how fast frames
+          // can be produced, so it is made overridable from the environment (SUNSHINE_SYSLAT_CAP_SLEEP_MS).
+          // An environment variable rather than a config key on purpose: a new config key would have to be
+          // registered in config.html, docs/configuration.md and en.json to satisfy the consistency test,
+          // and that is a lot of surface for a diagnostic knob that only exists to answer one question.
+          // NOTE: 0 removes the sleep entirely, which leaves the timeout path spinning on the D3D11 device
+          // lock -- use 1ms rather than 0 unless CPU burn is acceptable.
+          static const auto syslat_sleep10_ms = []() {
+            int ms = 10;
+            if (const char *override_ms = std::getenv("SUNSHINE_SYSLAT_CAP_SLEEP_MS")) {
+              const int parsed = std::atoi(override_ms);
+              if (parsed >= 0 && parsed <= 1000) {
+                ms = parsed;
+                BOOST_LOG(info) << "syslat capture-timeout sleep overridden to "sv << ms << "ms"sv;
+              }
+            }
+            return ms;
+          }();
           const auto syslat_t_sleep = std::chrono::steady_clock::now();
-          std::this_thread::sleep_for(10ms);
+          std::this_thread::sleep_for(std::chrono::milliseconds(syslat_sleep10_ms));
           syslat_sleep10_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - syslat_t_sleep).count();
         }
       }
