@@ -5,6 +5,8 @@
 #pragma once
 
 // platform includes
+#include <optional>
+
 #include <d3d11.h>
 #include <d3d11_4.h>
 #include <d3dcommon.h>
@@ -702,6 +704,18 @@ namespace platf::dxgi {
     texture2d_t old_surface_delayed_destruction;  ///< Old surface delayed destruction.
     std::chrono::steady_clock::time_point old_surface_timestamp;  ///< Old surface timestamp.
     std::variant<std::monostate, texture2d_t, std::shared_ptr<platf::img_t>> last_frame_variant;  ///< Last frame variant.
+
+    /**
+     * @brief Producer-side diagnostics for the desktop-duplication capture path.
+     *
+     * Needed because the encoder side became fully accounted for (the MFX submit is free and the GPU
+     * wait is measured) while the frame *source* was still a black box: both GPU engines sit far below
+     * saturation yet the pipeline only delivers ~48 fps at 4K, so the producer has to be shown to be
+     * the limit -- or shown not to be. All three are written by snapshot()/release_snapshot().
+     */
+    std::chrono::steady_clock::time_point syslat_prev_capture {};  ///< When the previous successful snapshot() returned.
+    std::optional<std::chrono::steady_clock::time_point> syslat_prev_present_ts {};  ///< Previous frame's presentation time, for the source's own interval.
+    int64_t syslat_release_us {0};  ///< Time accumulated in release_snapshot(), consumed by the next snapshot().
   };
 
   /**

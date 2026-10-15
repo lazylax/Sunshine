@@ -267,6 +267,13 @@ namespace platf::dxgi {
       platf::capture_e status = capture_e::ok;
       std::shared_ptr<img_t> img_out;
 
+      // syslat: the producer's per-iteration budget. The deliberate 10ms sleep further down happens
+      // OUTSIDE snapshot(), so only this line can attribute it -- and it directly caps how fast frames
+      // can be produced.
+      const auto syslat_t_iter = std::chrono::steady_clock::now();
+      int64_t syslat_sleep10_us = 0;
+      bool syslat_pushed = false;
+
       // Try to continue frame pacing group, snapshot() is called with zero timeout after waiting for client frame interval
       if (frame_pacing_group_start) {
         const uint32_t seconds = (uint64_t) frame_pacing_group_frames * client_frame_rate_adjusted.Denominator / client_frame_rate_adjusted.Numerator;
@@ -356,9 +363,13 @@ namespace platf::dxgi {
           // To avoid starving the encoding thread, sleep without the lock held for a little
           // while each time we reach our max frame timeout. This will only happen when nothing
           // is updating the display, so no visible stutter should be introduced by the sleep.
+          const auto syslat_t_sleep = std::chrono::steady_clock::now();
           std::this_thread::sleep_for(10ms);
+          syslat_sleep10_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - syslat_t_sleep).count();
         }
       }
+
+      const auto syslat_snap_status = (int) status;
 
       switch (status) {
         case platf::capture_e::reinit:
@@ -374,6 +385,7 @@ namespace platf::dxgi {
           if (!push_captured_image_cb(std::move(img_out), true)) {
             return capture_e::ok;
           }
+          syslat_pushed = true;
           break;
         default:
           BOOST_LOG(error) << "Unrecognized capture status ["sv << (int) status << ']';
@@ -384,6 +396,14 @@ namespace platf::dxgi {
       if (status != platf::capture_e::ok) {
         return status;
       }
+
+      // syslat: one line per capture-loop iteration. sleep10_us is the deliberate 10ms sleep taken
+      // whenever a snapshot times out or a frame-pacing group misses; it is spent outside snapshot(), so
+      // no capture-side probe can see it, yet it caps the rate at which frames can be produced.
+      BOOST_LOG(verbose) << "syslat capthr iter_us ["sv
+                         << std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - syslat_t_iter).count()
+                         << "] sleep10_us ["sv << syslat_sleep10_us << "] pushed ["sv << (syslat_pushed ? 1 : 0)
+                         << "] snap_status ["sv << syslat_snap_status << ']';
     }
 
     return capture_e::ok;

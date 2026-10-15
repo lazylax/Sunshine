@@ -2570,18 +2570,34 @@ namespace video {
         session->request_idr_frame();
       }
 
+      // syslat diagnostics: the consumer side of the capture handoff. pop_us is how long this thread
+      // waited for a captured frame -- if the encoder is starving, the producer is the limit -- and the
+      // whole iteration is reported alongside the encoder internals so the two instruments can be
+      // reconciled frame by frame.
+      const auto syslat_t_loop = std::chrono::steady_clock::now();
+      int64_t syslat_pop_us = 0;
+      bool syslat_got_img = false;
+
       std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
 
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
+        const auto syslat_t_pop = std::chrono::steady_clock::now();
         if (auto img = images->pop(max_frametime)) {
+          syslat_pop_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - syslat_t_pop).count();
+          syslat_got_img = true;
           frame_timestamp = img->frame_timestamp;
           if (session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
             return;
           }
-        } else if (!images->running()) {
-          break;
+        } else {
+          // The timeout path: nothing was captured within the minimum-fps window, so the encoder either
+          // repeats the previous frame or (if the source is gone) stops.
+          syslat_pop_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - syslat_t_pop).count();
+          if (!images->running()) {
+            break;
+          }
         }
       }
 
@@ -2599,10 +2615,19 @@ namespace video {
         break;
       }
 
+      const auto syslat_t_enc = std::chrono::steady_clock::now();
       if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp)) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         return;
       }
+
+      // syslat: one line per encode-loop iteration. pop_us + enc_us plus the capture-side line should add
+      // up to loop_us; anything left over is this loop's own bookkeeping (queue peeks, IDR handling).
+      const auto syslat_now = std::chrono::steady_clock::now();
+      BOOST_LOG(verbose) << "syslat enc loop frame ["sv << (frame_nr - 1) << "] pop_us ["sv << syslat_pop_us
+                         << "] got ["sv << (syslat_got_img ? 1 : 0) << "] wait_ms ["sv << max_frametime.count()
+                         << "] enc_us ["sv << std::chrono::duration_cast<std::chrono::microseconds>(syslat_now - syslat_t_enc).count()
+                         << "] loop_us ["sv << std::chrono::duration_cast<std::chrono::microseconds>(syslat_now - syslat_t_loop).count() << ']';
 
       session->request_normal_frame();
 

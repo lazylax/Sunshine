@@ -1374,14 +1374,42 @@ namespace platf::dxgi {
     DXGI_OUTDUPL_FRAME_INFO frame_info;
 
     resource_t::pointer res_p {};
+    // syslat capture-side diagnostics: the producer. Everything that can block, allocate or submit GPU
+    // work in this function is accumulated here and reported as ONE line per captured frame at the end,
+    // because at 4K/48fps a line per stage would itself become part of the load being measured.
+    const auto syslat_t_snap = std::chrono::steady_clock::now();
+    int64_t syslat_pull_us = 0, syslat_lock_us = 0, syslat_complete_us = 0;
+    int64_t syslat_copy_us = 0, syslat_cursor_us = 0, syslat_ptr_us = 0;
+
+    // The free-image handshake: this callback is what the display pulls an image out of the pool with,
+    // and it is the one call here that can block indefinitely when every image is still in flight.
+    auto syslat_pull = [&](std::shared_ptr<platf::img_t> &img) {
+      const auto t = std::chrono::steady_clock::now();
+      const bool ok = pull_free_image_cb(img);
+      syslat_pull_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t).count();
+      return ok;
+    };
+    auto syslat_lock = [&](texture_lock_helper &lock_helper) {
+      const auto t = std::chrono::steady_clock::now();
+      const bool ok = lock_helper.lock();
+      syslat_lock_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t).count();
+      return ok;
+    };
+    // CopyResource is the 4K frame copy: CPU-async, so the elapsed time here is the submit, not the copy.
+    auto syslat_copy = [&](auto dst, auto src_resource) {
+      const auto t = std::chrono::steady_clock::now();
+      device_ctx->CopyResource(dst, src_resource);
+      syslat_copy_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t).count();
+    };
+
     const auto syslat_t_next = std::chrono::steady_clock::now();
     auto capture_status = dup.next_frame(frame_info, timeout, &res_p);
+    const auto syslat_acq_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                 std::chrono::steady_clock::now() - syslat_t_next).count();
     // syslat diagnostic: the blocking AcquireNextFrame wait -- timeout is 0ms when called from the pacing
     // path and 200ms from the blocking path, so the ok/timeout ratio here is also our "is the desktop
     // presenting on demand" probe. Logged on timeout too on purpose.
-    BOOST_LOG(verbose) << "syslat snapshot wait_us ["sv
-                       << std::chrono::duration_cast<std::chrono::microseconds>(
-                              std::chrono::steady_clock::now() - syslat_t_next).count()
+    BOOST_LOG(verbose) << "syslat snapshot wait_us ["sv << syslat_acq_us
                        << "] timeout_ms ["sv << timeout.count() << "] status ["sv << (int) capture_status << ']';
     resource_t res {res_p};
 
@@ -1404,6 +1432,9 @@ namespace platf::dxgi {
     }
 
     if (frame_info.PointerShapeBufferSize > 0) {
+      // syslat: a shape change is rare, but it allocates two buffers and creates two textures while the
+      // duplication frame is held, so it belongs on the producer's ledger.
+      const auto syslat_t_ptr = std::chrono::steady_clock::now();
       DXGI_OUTDUPL_POINTER_SHAPE_INFO shape_info {};
 
       util::buffer_t<std::uint8_t> img_data {frame_info.PointerShapeBufferSize};
@@ -1422,6 +1453,8 @@ namespace platf::dxgi {
       if (!set_cursor_texture(device.get(), cursor_alpha, std::move(alpha_cursor_img), shape_info) || !set_cursor_texture(device.get(), cursor_xor, std::move(xor_cursor_img), shape_info)) {
         return capture_e::error;
       }
+
+      syslat_ptr_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - syslat_t_ptr).count();
     }
 
     if (frame_info.LastMouseUpdateTime.QuadPart) {
@@ -1565,14 +1598,16 @@ namespace platf::dxgi {
 
       // Finish creating the image (if it hasn't happened already),
       // also creates synchronization primitives for shared access from multiple direct3d devices.
+      const auto syslat_t_complete = std::chrono::steady_clock::now();
       if (complete_img(d3d_img.get(), dummy)) {
         return {nullptr, nullptr};
       }
+      syslat_complete_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - syslat_t_complete).count();
 
       // This image is shared between capture direct3d device and encoders direct3d devices,
       // we must acquire lock before doing anything to it.
       texture_lock_helper lock_helper(d3d_img->capture_mutex.get());
-      if (!lock_helper.lock()) {
+      if (!syslat_lock(lock_helper)) {
         BOOST_LOG(error) << "Failed to lock capture texture";
         return {nullptr, nullptr};
       }
@@ -1598,7 +1633,7 @@ namespace platf::dxgi {
           }
 
           std::shared_ptr<platf::img_t> img;
-          if (!pull_free_image_cb(img)) {
+          if (!syslat_pull(img)) {
             return capture_e::interrupted;
           }
 
@@ -1607,7 +1642,7 @@ namespace platf::dxgi {
             return capture_e::error;
           }
 
-          device_ctx->CopyResource(d3d_img->capture_texture.get(), p_surface->get());
+          syslat_copy(d3d_img->capture_texture.get(), p_surface->get());
 
           // We delay the destruction of intermediate surface in case the mouse cursor reappears shortly.
           old_surface_delayed_destruction.reset(p_surface->release());
@@ -1636,7 +1671,7 @@ namespace platf::dxgi {
             return capture_e::error;
           }
 
-          device_ctx->CopyResource(surface.get(), d3d_img->capture_texture.get());
+          syslat_copy(surface.get(), d3d_img->capture_texture.get());
           break;
         }
 
@@ -1645,7 +1680,7 @@ namespace platf::dxgi {
           last_frame_variant = {};
 
           std::shared_ptr<platf::img_t> img;
-          if (!pull_free_image_cb(img)) {
+          if (!syslat_pull(img)) {
             return capture_e::interrupted;
           }
 
@@ -1654,7 +1689,7 @@ namespace platf::dxgi {
             return capture_e::error;
           }
 
-          device_ctx->CopyResource(d3d_img->capture_texture.get(), src.get());
+          syslat_copy(d3d_img->capture_texture.get(), src.get());
           last_frame_variant = img;
           break;
         }
@@ -1669,7 +1704,7 @@ namespace platf::dxgi {
               return capture_e::error;
             }
           }
-          device_ctx->CopyResource(p_surface->get(), src.get());
+          syslat_copy(p_surface->get(), src.get());
           break;
         }
     }
@@ -1730,7 +1765,7 @@ namespace platf::dxgi {
             return capture_e::error;
           }
 
-          if (!pull_free_image_cb(img_out)) {
+          if (!syslat_pull(img_out)) {
             return capture_e::interrupted;
           }
 
@@ -1739,14 +1774,18 @@ namespace platf::dxgi {
             return capture_e::error;
           }
 
-          device_ctx->CopyResource(d3d_img->capture_texture.get(), p_surface->get());
-          blend_cursor(*d3d_img);
+          syslat_copy(d3d_img->capture_texture.get(), p_surface->get());
+          {
+            const auto syslat_t_cur = std::chrono::steady_clock::now();
+            blend_cursor(*d3d_img);
+            syslat_cursor_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - syslat_t_cur).count();
+          }
           break;
         }
 
       case ofa::dummy_fallback:
         {
-          if (!pull_free_image_cb(img_out)) {
+          if (!syslat_pull(img_out)) {
             return capture_e::interrupted;
           }
 
@@ -1766,7 +1805,9 @@ namespace platf::dxgi {
           }
 
           if (blend_mouse_cursor_flag) {
+            const auto syslat_t_cur = std::chrono::steady_clock::now();
             blend_cursor(*d3d_img);
+            syslat_cursor_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - syslat_t_cur).count();
           }
 
           break;
@@ -1782,11 +1823,45 @@ namespace platf::dxgi {
       img_out->frame_timestamp = frame_timestamp;
     }
 
+    // syslat: ONE line per captured frame, covering the producer. total_us is the whole snapshot() call;
+    // acq_us is AcquireNextFrame; pull_us is the free-image handshake -- the call that blocks when every
+    // image is still in flight; copy_us is the 4K texture copy submit; cur_us/ptr_us are cursor work;
+    // gap_us is the interval between two successful captures (the producer's real cadence) and pres_us is
+    // the interval between the two frames the compositor itself reported (the source's own rate). accum is
+    // DXGI's AccumulatedFrames, so >1 means the source presented while we were not looking. rel_us is how
+    // long the caller spent in the previous release_snapshot().
+    const auto syslat_t_end = std::chrono::steady_clock::now();
+    const auto syslat_total_us = std::chrono::duration_cast<std::chrono::microseconds>(syslat_t_end - syslat_t_snap).count();
+    const auto syslat_gap_us = syslat_prev_capture.time_since_epoch().count()
+                                 ? std::chrono::duration_cast<std::chrono::microseconds>(syslat_t_end - syslat_prev_capture).count()
+                                 : 0;
+    const auto syslat_present_us = (syslat_prev_present_ts && frame_timestamp)
+                                     ? std::chrono::duration_cast<std::chrono::microseconds>(*frame_timestamp - *syslat_prev_present_ts).count()
+                                     : 0;
+    BOOST_LOG(verbose) << "syslat cap total_us ["sv << syslat_total_us
+                       << "] acq_us ["sv << syslat_acq_us << "] pull_us ["sv << syslat_pull_us
+                       << "] lock_us ["sv << syslat_lock_us << "] comp_us ["sv << syslat_complete_us
+                       << "] copy_us ["sv << syslat_copy_us << "] cur_us ["sv << syslat_cursor_us
+                       << "] ptr_us ["sv << syslat_ptr_us << "] gap_us ["sv << syslat_gap_us
+                       << "] pres_us ["sv << syslat_present_us << "] accum ["sv << frame_info.AccumulatedFrames
+                       << "] rel_us ["sv << syslat_release_us << "] act ["sv
+                       << (int) last_frame_action << '/' << (int) out_frame_action << ']';
+
+    syslat_prev_capture = syslat_t_end;
+    syslat_prev_present_ts = frame_timestamp;
+    syslat_release_us = 0;
+
     return capture_e::ok;
   }
 
   capture_e display_ddup_vram_t::release_snapshot() {
-    return dup.release_frame();
+    // syslat: ReleaseFrame hands the frame back to the compositor and can block, and the caller does it
+    // immediately after snapshot(), so its cost belongs on the producer's ledger. Reported by the next
+    // snapshot() line rather than logged here, to keep the line count unchanged.
+    const auto syslat_t_rel = std::chrono::steady_clock::now();
+    const auto status = dup.release_frame();
+    syslat_release_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - syslat_t_rel).count();
+    return status;
   }
 
   int display_ddup_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
