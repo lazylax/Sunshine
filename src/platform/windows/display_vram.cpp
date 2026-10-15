@@ -1847,6 +1847,11 @@ namespace platf::dxgi {
                        << "] rel_us ["sv << syslat_release_us << "] act ["sv
                        << (int) last_frame_action << '/' << (int) out_frame_action << ']';
 
+    // The pacing feedback guard in display_base_t::capture() reads this instead of parsing our log, so it
+    // can decide from the same evidence a human reads here: accum > 1 means the source presented while we
+    // were not looking.
+    last_frame_accumulated_frames = frame_info.AccumulatedFrames;
+
     syslat_prev_capture = syslat_t_end;
     syslat_prev_present_ts = frame_timestamp;
     syslat_release_us = 0;

@@ -243,6 +243,106 @@ namespace platf::dxgi {
     BOOST_LOG(verbose) << "syslat rate requested ["sv << client_frame_rate << "] adjusted ["
                        << client_frame_rate_adjusted.Numerator << '/' << client_frame_rate_adjusted.Denominator << ']';
 
+    // syslat diagnostic: the PACING POLICY. Upstream added exactly this decision for Pipewire in
+    // cb72dffa ("add support for unpaced capture when appropriate"): pace only when the captured source
+    // can run FASTER than the client asked for, because decimating a faster source is the entire point
+    // of the grid. The Windows path never had it, so it paces even when the display is SLOWER than the
+    // request -- and when the grid period G is close to the source period P the zero-timeout grid probe
+    // sits on a knife edge: one miss drops the loop into a 200ms blocking acquire, which then waits for
+    // the NEXT present and so skips the very frame we wanted. Measured consequence on this rig: a 4K@120
+    // desktop (dxgidup, no stream: 120.2 Hz) captured at ~58.8 fps with DXGI reporting accum=2, i.e.
+    // every other present taken. `auto` is the fix; `on`/`off` exist so the two halves can be A/B'd in
+    // one build. These are environment variables rather than config keys on purpose: a config key must
+    // be registered in config.html, docs/configuration.md and en.json or the consistency test fails,
+    // which is far too much surface for a knob that only exists to answer one diagnostic question (same
+    // rationale as SUNSHINE_SYSLAT_CAP_SLEEP_MS below).
+    //   SUNSHINE_SYSLAT_PACING               auto | on | off
+    //   SUNSHINE_SYSLAT_PACING_MARGIN        percent headroom `auto` demands of the display rate
+    //   SUNSHINE_SYSLAT_PACING_RECOVER_MS    short-timeout retry length after a grid miss (0 = off)
+    //   SUNSHINE_SYSLAT_PACING_RECOVER_TRIES max retries per miss
+    //   SUNSHINE_SYSLAT_PACING_FEEDBACK      1 = also stop pacing if DXGI keeps reporting accum >= 2
+    static const auto syslat_env_int = [](const char *name, int fallback, int lo, int hi) {
+      if (const char *raw = std::getenv(name)) {
+        const int parsed = std::atoi(raw);
+        if (parsed >= lo && parsed <= hi) {
+          return parsed;
+        }
+        BOOST_LOG(warning) << "syslat ignoring out-of-range "sv << name << " ["sv << raw << ']';
+      }
+      return fallback;
+    };
+    static const std::string syslat_pacing_mode = []() {
+      if (const char *raw = std::getenv("SUNSHINE_SYSLAT_PACING")) {
+        const std::string mode {raw};
+        if (mode == "on" || mode == "off") {
+          return mode;
+        }
+      }
+      return std::string {"auto"};
+    }();
+    static const int syslat_pacing_margin_pct = syslat_env_int("SUNSHINE_SYSLAT_PACING_MARGIN", 10, 0, 900);
+    static const int syslat_pacing_recover_ms = syslat_env_int("SUNSHINE_SYSLAT_PACING_RECOVER_MS", 2, 0, 200);
+    static const int syslat_pacing_recover_tries = syslat_env_int("SUNSHINE_SYSLAT_PACING_RECOVER_TRIES", 4, 0, 100);
+    static const int syslat_pacing_feedback = syslat_env_int("SUNSHINE_SYSLAT_PACING_FEEDBACK", 1, 0, 1);
+
+    const double syslat_client_rate = client_frame_rate_adjusted.Denominator > 0
+                                        ? (double) client_frame_rate_adjusted.Numerator / client_frame_rate_adjusted.Denominator
+                                        : 0.0;
+    const double syslat_display_rate = display_refresh_rate.Denominator > 0
+                                         ? (double) display_refresh_rate.Numerator / display_refresh_rate.Denominator
+                                         : 0.0;
+    const double syslat_pacing_margin = 1.0 + (double) syslat_pacing_margin_pct / 100.0;
+    const double syslat_pacing_ratio = (syslat_client_rate > 0.0 && syslat_display_rate > 0.0)
+                                         ? syslat_display_rate / syslat_client_rate
+                                         : 0.0;
+
+    bool syslat_pacing = true;
+    bool syslat_display_unknown = false;
+    if (syslat_pacing_mode == "on") {
+      syslat_pacing = true;
+    } else if (syslat_pacing_mode == "off") {
+      syslat_pacing = false;
+    } else if (syslat_pacing_ratio <= 0.0) {
+      // The reported refresh rate is unusable: keep upstream behaviour rather than guess.
+      syslat_display_unknown = true;
+    } else {
+      syslat_pacing = syslat_pacing_ratio > syslat_pacing_margin;
+    }
+
+    BOOST_LOG(info) << "syslat pacing policy mode ["sv << syslat_pacing_mode
+                    << "] display_rate ["sv << syslat_display_rate
+                    << "] client_rate ["sv << syslat_client_rate
+                    << "] ratio ["sv << syslat_pacing_ratio
+                    << "] margin_pct ["sv << syslat_pacing_margin_pct
+                    << "] required ["sv << (syslat_pacing ? 1 : 0)
+                    << "] unknown_display ["sv << (syslat_display_unknown ? 1 : 0)
+                    << "] recover_ms ["sv << syslat_pacing_recover_ms
+                    << "] recover_tries ["sv << syslat_pacing_recover_tries
+                    << "] feedback ["sv << syslat_pacing_feedback << ']';
+    if (!syslat_pacing && syslat_pacing_mode == "auto") {
+      // The upstream wording for the same decision, so a log reader can grep one phrase across platforms.
+      BOOST_LOG(info) << "syslat frame pacing: disabled (event-driven capture) -- display "sv << syslat_display_rate
+                      << "Hz is not "sv << syslat_pacing_margin << "x the requested "sv << syslat_client_rate << "fps"sv;
+    } else if (syslat_pacing && syslat_pacing_mode == "on" && syslat_pacing_ratio > 0.0 && syslat_pacing_ratio <= syslat_pacing_margin) {
+      BOOST_LOG(warning) << "syslat frame pacing: forced ON although the display ("sv << syslat_display_rate
+                         << "Hz) is not "sv << syslat_pacing_margin << "x the requested "sv << syslat_client_rate
+                         << "fps -- expect grid misses"sv;
+    }
+
+    // Per-capture-session counters behind the aggregate `syslat pacing stats` line. They are what turns
+    // "fps went up" into an attribution: how many frames came from the grid, from the short-timeout
+    // recovery, and from the blocking acquire, and how often the grid missed.
+    uint64_t syslat_frames_paced = 0;
+    uint64_t syslat_frames_recov = 0;
+    uint64_t syslat_frames_block = 0;
+    uint64_t syslat_frames_event = 0;
+    uint64_t syslat_group_misses = 0;
+    uint64_t syslat_recoveries = 0;
+    uint64_t syslat_recover_failures = 0;
+    uint64_t syslat_accum_high = 0;
+    int64_t syslat_sum_sleep_us = 0;
+    int64_t syslat_sum_age_us = 0;
+
     std::optional<std::chrono::steady_clock::time_point> frame_pacing_group_start;
     uint32_t frame_pacing_group_frames = 0;
 
@@ -274,9 +374,12 @@ namespace platf::dxgi {
       const auto syslat_t_iter = std::chrono::steady_clock::now();
       int64_t syslat_sleep10_us = 0;
       bool syslat_pushed = false;
+      // Set when this iteration's grid probe came up empty, which is what arms the short-timeout
+      // recovery below. Kept separate from `status` because a missing frame is not always a timeout.
+      bool syslat_recover_needed = false;
 
       // Try to continue frame pacing group, snapshot() is called with zero timeout after waiting for client frame interval
-      if (frame_pacing_group_start) {
+      if (syslat_pacing && frame_pacing_group_start) {
         const uint32_t seconds = (uint64_t) frame_pacing_group_frames * client_frame_rate_adjusted.Denominator / client_frame_rate_adjusted.Numerator;
         const uint32_t remainder = (uint64_t) frame_pacing_group_frames * client_frame_rate_adjusted.Denominator % client_frame_rate_adjusted.Numerator;
         const auto sleep_target = *frame_pacing_group_start +
@@ -288,7 +391,9 @@ namespace platf::dxgi {
           // We missed next frame time, invalidating current frame pacing group
           BOOST_LOG(verbose) << "syslat group miss sleep_us ["sv
                              << std::chrono::duration_cast<std::chrono::microseconds>(sleep_period).count()
-                             << "] group_frames ["sv << frame_pacing_group_frames << ']';
+                             << "] group_frames ["sv << frame_pacing_group_frames << "] recover [1]";
+          ++syslat_group_misses;
+          syslat_recover_needed = true;
           frame_pacing_group_start = std::nullopt;
           frame_pacing_group_frames = 0;
           status = capture_e::timeout;
@@ -305,27 +410,93 @@ namespace platf::dxgi {
           // design, and it is included in "Frame processing latency" downstream. sleep_us is how much we
           // slept. ONE line per frame on purpose: several probes per frame would perturb the measurement.
           if (status == capture_e::ok && img_out && img_out->frame_timestamp) {
-            BOOST_LOG(verbose) << "syslat cap path [pacing0] sleep_us ["sv
-                               << std::chrono::duration_cast<std::chrono::microseconds>(sleep_period).count()
-                               << "] age_us ["sv
-                               << std::chrono::duration_cast<std::chrono::microseconds>(
-                                    std::chrono::steady_clock::now() - *img_out->frame_timestamp).count()
+            const auto syslat_age_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now() - *img_out->frame_timestamp)
+                                         .count();
+            const auto syslat_sleep_us = std::chrono::duration_cast<std::chrono::microseconds>(sleep_period).count();
+            BOOST_LOG(verbose) << "syslat cap path [pacing0] sleep_us ["sv << syslat_sleep_us
+                               << "] age_us ["sv << syslat_age_us
                                << "] group_frames ["sv << frame_pacing_group_frames << ']';
+            syslat_sum_sleep_us += syslat_sleep_us;
+            syslat_sum_age_us += syslat_age_us;
           }
 
           if (status == capture_e::ok && img_out) {
             frame_pacing_group_frames += 1;
+            ++syslat_frames_paced;
           } else {
-            BOOST_LOG(verbose) << "syslat group miss sleep_us [0] group_frames ["sv << frame_pacing_group_frames << ']';
+            BOOST_LOG(verbose) << "syslat group miss sleep_us [0] group_frames ["sv << frame_pacing_group_frames << "] recover [1]";
+            ++syslat_group_misses;
+            syslat_recover_needed = true;
             frame_pacing_group_start = std::nullopt;
             frame_pacing_group_frames = 0;
           }
         }
       }
 
+      // syslat: grid-miss recovery. A missed grid point is normally only microseconds away from the
+      // present we wanted, so retry with a SHORT timeout instead of falling straight into the 200ms
+      // blocking acquire -- that acquire waits for the NEXT present and therefore skips a whole source
+      // frame, which is exactly how a 120Hz desktop ends up captured at 60fps. When a frame is obtained
+      // this way the group is RE-ANCHORED on that frame's own timestamp, so the grid phase follows the
+      // source instead of drifting against it. Setting SUNSHINE_SYSLAT_PACING_RECOVER_MS=0 restores the
+      // old "one miss costs one whole present" behaviour exactly, which is the control arm for the A/B.
+      if (syslat_recover_needed && syslat_pacing && syslat_pacing_recover_ms > 0 && syslat_pacing_recover_tries > 0) {
+        const auto syslat_t_recov = std::chrono::steady_clock::now();
+        int syslat_tries = 0;
+        while (syslat_tries < syslat_pacing_recover_tries) {
+          ++syslat_tries;
+          status = snapshot(pull_free_image_cb, img_out, std::chrono::milliseconds(syslat_pacing_recover_ms), *cursor);
+          if (status == capture_e::ok && img_out) {
+            break;
+          }
+          if (status != capture_e::timeout) {
+            // reinit/error/interrupted: leave it for the switch below to classify.
+            break;
+          }
+          // snapshot() went to the trouble of a blocking AcquireNextFrame; yield so we do not spin on the
+          // unfair D3D11 device lock and starve the encoding thread (see the long note further down).
+          std::this_thread::yield();
+        }
+        const auto syslat_recov_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now() - syslat_t_recov)
+                                       .count();
+
+        if (status == capture_e::ok && img_out) {
+          ++syslat_recoveries;
+          ++syslat_frames_recov;
+          const auto syslat_age_us = img_out->frame_timestamp
+                                       ? std::chrono::duration_cast<std::chrono::microseconds>(
+                                           std::chrono::steady_clock::now() - *img_out->frame_timestamp)
+                                           .count()
+                                       : 0;
+          frame_pacing_group_start = img_out->frame_timestamp.value_or(std::chrono::steady_clock::now());
+          frame_pacing_group_frames = 1;
+          syslat_sum_age_us += syslat_age_us;
+          BOOST_LOG(verbose) << "syslat cap path [recov] tries ["sv << syslat_tries
+                             << "] wait_us ["sv << syslat_recov_us
+                             << "] age_us ["sv << syslat_age_us << "] group_frames [1]";
+        } else if (status == capture_e::timeout || (status == capture_e::ok && !img_out)) {
+          ++syslat_recover_failures;
+          BOOST_LOG(verbose) << "syslat recov failed tries ["sv << syslat_tries
+                             << "] wait_us ["sv << syslat_recov_us << "] status ["sv << (int) status << ']';
+          status = capture_e::timeout;
+        } else {
+          BOOST_LOG(verbose) << "syslat recov aborted wait_us ["sv << syslat_recov_us
+                             << "] status ["sv << (int) status << ']';
+        }
+      }
+
       // Start new frame pacing group if necessary, snapshot() is called with non-zero timeout
       if (status == capture_e::timeout || (status == capture_e::ok && !frame_pacing_group_start)) {
         status = snapshot(pull_free_image_cb, img_out, 200ms, *cursor);
+        ++syslat_frames_block;
+        if (!syslat_pacing) {
+          // With pacing off this is not a "fallback", it is the whole loop: wait for the desktop to
+          // present and take it. Counted separately so the aggregate can prove event-driven capture took
+          // over (`event` == `block` and `paced` + `recov` == 0).
+          ++syslat_frames_event;
+        }
 
         // syslat diagnostic: the blocking path -- we waited (up to 200 ms) for the desktop to present
         // something new, so age_us here should be small. Comparing age_us between [pacing0] and [block200]
@@ -334,10 +505,13 @@ namespace platf::dxgi {
           BOOST_LOG(verbose) << "syslat cap path [block200] sleep_us [0] age_us ["sv
                              << std::chrono::duration_cast<std::chrono::microseconds>(
                                   std::chrono::steady_clock::now() - *img_out->frame_timestamp).count()
-                             << ']';
+                             << "] pacing ["sv << (syslat_pacing ? 1 : 0) << ']';
         }
 
-        if (status == capture_e::ok && img_out) {
+        // The group is only ever (re)anchored while pacing is on; with pacing off the loop above never
+        // starts a group, which is what makes every iteration fall into this blocking acquire -- i.e.
+        // event-driven capture driven by the compositor's own presents.
+        if (status == capture_e::ok && img_out && syslat_pacing) {
           frame_pacing_group_start = img_out->frame_timestamp;
 
           if (!frame_pacing_group_start) {
@@ -414,6 +588,47 @@ namespace platf::dxgi {
       status = release_snapshot();
       if (status != platf::capture_e::ok) {
         return status;
+      }
+
+      // syslat diagnostic: the pacing feedback guard. Even with the ratio policy, the refresh rate DXGI
+      // reports can be a lie relative to what the desktop actually sustains -- on this rig 4K advertises
+      // 120Hz and does present at ~120Hz when idle, yet the moment the encoder is running the compositor
+      // only hands over every other present. DXGI tells us that directly: AccumulatedFrames > 1 means the
+      // source presented while we were not looking. If that keeps happening, pacing is provably costing
+      // frames, so stop pacing for the rest of this capture session and let the presents drive the loop.
+      // Only the DXGI duplication backend reports accum (see display_t::last_frame_accumulated_frames).
+      if (syslat_pacing && syslat_pacing_feedback && last_frame_accumulated_frames >= 2) {
+        ++syslat_accum_high;
+        if (syslat_accum_high >= 30) {
+          syslat_pacing = false;
+          frame_pacing_group_start = std::nullopt;
+          frame_pacing_group_frames = 0;
+          BOOST_LOG(info) << "syslat pacing feedback: disabled (event-driven capture) -- DXGI reported accum >= 2 for ["sv
+                          << syslat_accum_high << "] consecutive frames"sv;
+        }
+      } else if (last_frame_accumulated_frames < 2) {
+        syslat_accum_high = 0;
+      }
+
+      // syslat diagnostic: one aggregate line per 120 produced frames. The per-frame probes say what each
+      // frame cost; this says WHERE the frames came from, which is the only way to tell "the fix worked"
+      // from "the loop found another route to the same frame count". avg_sleep_us/avg_age_us are over the
+      // frames that were actually paced (plus recovered, for age), so they must be read together with the
+      // counts.
+      const uint64_t syslat_frames_total = syslat_frames_paced + syslat_frames_recov + syslat_frames_block;
+      if (syslat_frames_total > 0 && syslat_frames_total % 120 == 0) {
+        const uint64_t syslat_n_aged = syslat_frames_paced + syslat_frames_recov;
+        BOOST_LOG(info) << "syslat pacing stats frames ["sv << syslat_frames_total
+                        << "] paced ["sv << syslat_frames_paced
+                        << "] recov ["sv << syslat_frames_recov
+                        << "] block ["sv << syslat_frames_block
+                        << "] event ["sv << syslat_frames_event
+                        << "] group_misses ["sv << syslat_group_misses
+                        << "] recoveries ["sv << syslat_recoveries
+                        << "] recov_fail ["sv << syslat_recover_failures
+                        << "] avg_sleep_us ["sv << (syslat_frames_paced ? syslat_sum_sleep_us / (int64_t) syslat_frames_paced : 0)
+                        << "] avg_age_us ["sv << (syslat_n_aged ? syslat_sum_age_us / (int64_t) syslat_n_aged : 0)
+                        << "] pacing ["sv << (syslat_pacing ? 1 : 0) << ']';
       }
 
       // syslat: one line per capture-loop iteration. sleep10_us is the deliberate 10ms sleep taken

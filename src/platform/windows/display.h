@@ -327,6 +327,15 @@ namespace platf::dxgi {
     int client_frame_rate;  ///< Client frame rate.
     DXGI_RATIONAL client_frame_rate_strict;  ///< Client frame rate strict.
 
+    /**
+     * @brief DXGI's AccumulatedFrames from the most recent successful snapshot().
+     * @details A value greater than 1 means the desktop presented at least once while the capture loop
+     * was not looking, which is direct evidence that the frame-pacing grid is costing frames. Written by
+     * display_ddup_vram_t::snapshot(); a backend that never writes it leaves the feedback guard dormant,
+     * which is the safe default.
+     */
+    uint32_t last_frame_accumulated_frames {0};
+
     DXGI_FORMAT capture_format;  ///< Capture format.
     D3D_FEATURE_LEVEL feature_level;  ///< Feature level.
 
