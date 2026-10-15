@@ -296,6 +296,15 @@ namespace platf::dxgi {
                                          ? syslat_display_rate / syslat_client_rate
                                          : 0.0;
 
+    // How many presents DXGI SHOULD accumulate between two of our paced acquisitions -- i.e. how many
+    // source frames a legitimately decimating grid is allowed to skip. At source 200Hz / client 120fps
+    // that is 2, and seeing accum=2 there is correct behaviour, not a fault. The feedback guard below
+    // compares against this instead of against a flat ">= 2", because a flat threshold would switch off
+    // pacing exactly in the decimation regime where pacing is the point and let the encoder queue absorb
+    // 200fps. 1 when the ratio is unknown: then pacing is never disabled on accum evidence alone.
+    const uint32_t syslat_ratio_ceil = syslat_pacing_ratio > 0.0 ? (uint32_t) std::ceil(syslat_pacing_ratio) : 0;
+    const uint32_t syslat_expected_accum = syslat_ratio_ceil > 1 ? syslat_ratio_ceil : 1;
+
     bool syslat_pacing = true;
     bool syslat_display_unknown = false;
     if (syslat_pacing_mode == "on") {
@@ -315,6 +324,7 @@ namespace platf::dxgi {
                     << "] ratio ["sv << syslat_pacing_ratio
                     << "] margin_pct ["sv << syslat_pacing_margin_pct
                     << "] required ["sv << (syslat_pacing ? 1 : 0)
+                    << "] expected_accum ["sv << syslat_expected_accum
                     << "] unknown_display ["sv << (syslat_display_unknown ? 1 : 0)
                     << "] recover_ms ["sv << syslat_pacing_recover_ms
                     << "] recover_tries ["sv << syslat_pacing_recover_tries
@@ -592,21 +602,23 @@ namespace platf::dxgi {
 
       // syslat diagnostic: the pacing feedback guard. Even with the ratio policy, the refresh rate DXGI
       // reports can be a lie relative to what the desktop actually sustains -- on this rig 4K advertises
-      // 120Hz and does present at ~120Hz when idle, yet the moment the encoder is running the compositor
-      // only hands over every other present. DXGI tells us that directly: AccumulatedFrames > 1 means the
-      // source presented while we were not looking. If that keeps happening, pacing is provably costing
-      // frames, so stop pacing for the rest of this capture session and let the presents drive the loop.
+      // 120Hz and does present at ~120Hz when idle, yet with the encoder running the compositor only
+      // hands over every other present. DXGI tells us that directly: AccumulatedFrames is the number of
+      // source presents that happened while we were not looking, so it must be compared with what the
+      // grid intends to skip (syslat_expected_accum), not with a flat 2 -- at source 200Hz / client 120fps
+      // accum=2 is the design, and disabling pacing there would push 200fps into a ~67fps encoder.
       // Only the DXGI duplication backend reports accum (see display_t::last_frame_accumulated_frames).
-      if (syslat_pacing && syslat_pacing_feedback && last_frame_accumulated_frames >= 2) {
+      if (syslat_pacing && syslat_pacing_feedback && last_frame_accumulated_frames > syslat_expected_accum) {
         ++syslat_accum_high;
         if (syslat_accum_high >= 30) {
           syslat_pacing = false;
           frame_pacing_group_start = std::nullopt;
           frame_pacing_group_frames = 0;
-          BOOST_LOG(info) << "syslat pacing feedback: disabled (event-driven capture) -- DXGI reported accum >= 2 for ["sv
-                          << syslat_accum_high << "] consecutive frames"sv;
+          BOOST_LOG(info) << "syslat pacing feedback: disabled (event-driven capture) -- DXGI reported accum ["sv
+                          << last_frame_accumulated_frames << "] above the ["sv << syslat_expected_accum
+                          << "] this grid intends to skip, for ["sv << syslat_accum_high << "] consecutive frames"sv;
         }
-      } else if (last_frame_accumulated_frames < 2) {
+      } else if (last_frame_accumulated_frames <= syslat_expected_accum) {
         syslat_accum_high = 0;
       }
 
