@@ -47,6 +47,7 @@ static FILE *g_log;
 static fn_encode g_encode;
 static fn_sync g_sync;
 static LARGE_INTEGER g_freq;
+static LARGE_INTEGER g_t0;   /* set once at load, so every line carries a monotonic ms stamp */
 static volatile LONG g_n_encode;
 static volatile LONG g_n_sync;
 
@@ -55,6 +56,7 @@ static BOOL CALLBACK proxy_init(PINIT_ONCE once, PVOID param, PVOID *ctx) {
   const char *log_path;
 
   QueryPerformanceFrequency(&g_freq);
+  QueryPerformanceCounter(&g_t0);
   InitializeCriticalSection(&g_lock);
 
   /* Full path first so the search cannot come back to this proxy. An env override makes it easy to
@@ -91,6 +93,18 @@ static double elapsed_us(LARGE_INTEGER start) {
   return (double) (now.QuadPart - start.QuadPart) * 1e6 / (double) g_freq.QuadPart;
 }
 
+/* Milliseconds since this proxy was initialised. Lets the MFX log be lined up with sunshine.log /
+ * the syslat probes (which are wall clock) and gives every line a rate context; without it the two
+ * logs can only be compared by event order. */
+static double ms_since_load(void) {
+  LARGE_INTEGER now;
+  QueryPerformanceCounter(&now);
+  if (!g_freq.QuadPart || !g_t0.QuadPart) {
+    return 0.0;
+  }
+  return (double) (now.QuadPart - g_t0.QuadPart) * 1e3 / (double) g_freq.QuadPart;
+}
+
 static void log_line(const char *fmt, ...) {
   va_list ap;
   if (!g_log) {
@@ -117,8 +131,8 @@ mfxStatus MFXVideoENCODE_EncodeFrameAsync(mfxSession session, void *ctrl, void *
 
   /* Log every call: at 4K/48 fps this is ~48 lines per second, far below the rate at which logging
    * itself would perturb the measurement, and a sub-sampled view would hide the blocking submits. */
-  log_line("enc n=%ld tid=%lu us=%.0f st=%d surf=%p sync=%p",
-           (long) n, (unsigned long) GetCurrentThreadId(), elapsed_us(start), (int) status,
+  log_line("enc t=%.0f n=%ld tid=%lu us=%.0f st=%d surf=%p sync=%p",
+           ms_since_load(), (long) n, (unsigned long) GetCurrentThreadId(), elapsed_us(start), (int) status,
            surface, (void *) (syncp ? *syncp : NULL));
   return status;
 }
@@ -133,8 +147,8 @@ mfxStatus MFXVideoCORE_SyncOperation(mfxSession session, mfxSyncPoint syncp, uin
   status = g_sync ? g_sync(session, syncp, wait) : -3;
   n = InterlockedIncrement(&g_n_sync);
 
-  log_line("sync n=%ld tid=%lu us=%.0f st=%d wait=%lu sync=%p",
-           (long) n, (unsigned long) GetCurrentThreadId(), elapsed_us(start), (int) status,
+  log_line("sync t=%.0f n=%ld tid=%lu us=%.0f st=%d wait=%lu sync=%p",
+           ms_since_load(), (long) n, (unsigned long) GetCurrentThreadId(), elapsed_us(start), (int) status,
            (unsigned long) wait, (void *) syncp);
   return status;
 }
