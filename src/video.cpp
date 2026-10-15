@@ -545,6 +545,13 @@ namespace video {
     // be tied back to its capture timestamp -- and to the IDR request that produced it -- through a pending
     // map keyed by the pts stamped on the input frame. Because pts is monotonic, the map is also ordered by
     // submission order, so begin() is the oldest frame still outstanding.
+    /**
+     * @brief What a frame that was submitted to the encoder is still waiting for.
+     *
+     * Needed because the packet for that frame only comes back several submissions later once
+     * async_depth is greater than 1, so its capture timestamp and its IDR request cannot be read off
+     * the frame currently being submitted.
+     */
     struct syslat_pending_frame_t {
       std::optional<std::chrono::steady_clock::time_point> ts;  ///< Capture timestamp of the submitted frame.
       bool idr_requested;  ///< Whether an IDR was requested for the submitted frame.

@@ -401,6 +401,10 @@ jobs:
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        # diag branch: by default a failing step skips every later one, so a docs/test/lint failure
+        # withholds a perfectly good binary and costs another 45-90 minute rebuild. Upload whatever the
+        # build produced; if-no-files-found still fails the step when nothing was built at all.
+        if: ${{ !cancelled() }}
         with:
           name: build-${{ matrix.name }}
           path: artifacts/
