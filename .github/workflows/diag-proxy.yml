@@ -47,8 +47,11 @@ jobs:
           cd tools\mfxproxy
           dumpbin /exports mfxhook.dll > exports.txt
           type exports.txt
-          findstr /c:"MFXVideoENCODE_EncodeFrameAsync" exports.txt && exit /b 1
+          findstr /c:"MFXVideoENCODE_EncodeFrameAsync" exports.txt >nul && (echo unexpected export ^& exit /b 1)
           echo no MFX exports, as intended
+          rem cmd leaves ERRORLEVEL untouched by echo, so an earlier findstr miss would otherwise
+          rem become this step's exit code even though nothing went wrong.
+          exit /b 0
 
       - name: Upload mfxhook
         uses: actions/upload-artifact@v4
