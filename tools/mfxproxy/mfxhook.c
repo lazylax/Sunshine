@@ -164,6 +164,29 @@ static int name_matches(LPCSTR a, const char *b) {
   return _stricmp(a, b) == 0;
 }
 
+/*
+ * Which import descriptor actually carries GetProcAddress. On a normal MSVC build this is KERNEL32.dll,
+ * but a toolchain that links against the API-set umbrellas can name it
+ * api-ms-win-core-libraryloader-*.dll, and a redirected build can name KERNELBASE.dll. Matching only
+ * "KERNEL32.dll" would silently install no hook at all -- which would look exactly like "the encoder
+ * never called through GetProcAddress" and cost a whole panel run to find out.
+ */
+static int is_library_loader(LPCSTR name) {
+  if (!name) {
+    return 0;
+  }
+  if (_strnicmp(name, "KERNEL32", 8) == 0) {
+    return 1;
+  }
+  if (_strnicmp(name, "KERNELBASE", 10) == 0) {
+    return 1;
+  }
+  if (_strnicmp(name, "api-ms-win-core-libraryloader", 29) == 0) {
+    return 1;
+  }
+  return 0;
+}
+
 static int patch_main_module_iat(const char *dll, const char *func, void *replacement, void **original) {
   BYTE *base = (BYTE *) GetModuleHandleW(NULL);
   IMAGE_DOS_HEADER *dos;
@@ -189,7 +212,11 @@ static int patch_main_module_iat(const char *dll, const char *func, void *replac
     IMAGE_THUNK_DATA64 *thunk;
     IMAGE_THUNK_DATA64 *iat;
 
-    if (dll && !name_matches(module_name, dll)) {
+    if (dll) {
+      if (!name_matches(module_name, dll)) {
+        continue;
+      }
+    } else if (!is_library_loader(module_name)) {
       continue;
     }
     thunk = (IMAGE_THUNK_DATA64 *) (base + imp->OriginalFirstThunk);
@@ -235,7 +262,7 @@ static void install_hook(void) {
   }
 
   log_line("# mfxhook attaching to %ls", exe);
-  if (patch_main_module_iat("KERNEL32.dll", "GetProcAddress", (void *) &hook_get_proc_address,
+  if (patch_main_module_iat(NULL, "GetProcAddress", (void *) &hook_get_proc_address,
                             (void **) &g_real_get_proc_address)) {
     log_line("# GetProcAddress IAT patched (original=%p)", (void *) g_real_get_proc_address);
   } else {
