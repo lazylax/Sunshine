@@ -8,6 +8,7 @@
 #include <atomic>
 #include <bitset>
 #include <list>
+#include <map>
 #include <thread>
 #include <utility>
 
@@ -539,9 +540,22 @@ namespace video {
     // inject sps/vps data into idr pictures
     int inject;  ///< Number of upcoming IDR frames that should receive rewritten parameter sets.
 
-    // syslat diagnostics (see encode_avcodec): timestamp coverage of this session's packets.
+    // syslat diagnostics (see encode_avcodec): with async_depth>1 the packet returned by
+    // avcodec_receive_packet() belongs to a frame submitted async_depth frames earlier, so a packet can only
+    // be tied back to its capture timestamp -- and to the IDR request that produced it -- through a pending
+    // map keyed by the pts stamped on the input frame. Because pts is monotonic, the map is also ordered by
+    // submission order, so begin() is the oldest frame still outstanding.
+    struct syslat_pending_frame_t {
+      std::optional<std::chrono::steady_clock::time_point> ts;  ///< Capture timestamp of the submitted frame.
+      bool idr_requested;  ///< Whether an IDR was requested for the submitted frame.
+    };
+
+    std::map<int64_t, syslat_pending_frame_t> syslat_pending;  ///< Submitted-but-not-returned frames, keyed by pts.
     long long syslat_pkts {0};  ///< Packets raised by encode_avcodec() in this session.
-    long long syslat_ts_hits {0};  ///< Of those, how many could be matched to the frame just submitted.
+    long long syslat_ts_hits {0};  ///< Of those, how many were matched to their own frame by pts.
+    long long syslat_ts_fifo {0};  ///< Of those, how many fell back to FIFO because the pts lookup missed.
+    long long syslat_ts_miss {0};  ///< Packets that could not be matched to any pending frame.
+    long long syslat_pending_dropped {0};  ///< Pending frames retired without a packet (flushed or dropped).
   };
 
   /**
@@ -1849,6 +1863,22 @@ namespace video {
       return -1;
     }
 
+    // syslat: remember what this submission was, so the packet that eventually comes back for it can still
+    // be identified. This is recorded even when the capture timestamp is absent, because the IDR check
+    // further down needs the same pts -> submission association.
+    session.syslat_pending.emplace(
+      frame_nr,
+      avcodec_encode_session_t::syslat_pending_frame_t {frame_timestamp, (frame->flags & AV_FRAME_FLAG_KEY) != 0}
+    );
+
+    // Bound the map: a healthy session only ever holds ~async_depth entries. Anything beyond a generous cap
+    // means the encoder stopped returning packets for those frames (internal flush or drop), so retire the
+    // oldest and count it instead of growing without limit across an 8-hour diagnostic run.
+    while (session.syslat_pending.size() > 64) {
+      session.syslat_pending.erase(session.syslat_pending.begin());
+      session.syslat_pending_dropped++;
+    }
+
     while (ret >= 0) {
       auto packet = std::make_unique<packet_raw_avcodec>();
       auto av_packet = packet.get()->av_packet;
@@ -1864,17 +1894,16 @@ namespace video {
         return ret;
       }
 
+      // syslat: the pts the encoder stamped on this packet, read before the packet is handed to the queue
+      // (the consumer may free it as soon as it is raised).
+      const long long syslat_pkt_pts = (long long) av_packet->pts;
+
       if (av_packet->flags & AV_PKT_FLAG_KEY) {
         BOOST_LOG(debug) << "Frame "sv << frame_nr << ": IDR Keyframe (AV_FRAME_FLAG_KEY)"sv;
       }
 
-      // syslat: only compare flags when this packet really belongs to the frame we just submitted -- with
-      // async_depth>1 the encoder can hand back the previous frame's packet here. This branch only logs,
-      // so the guard is cosmetic, but a false "did not produce IDR" line would mislead exactly the
-      // loss-recovery investigation we are running.
-      if (av_packet->pts == frame_nr && (frame->flags & AV_FRAME_FLAG_KEY) && !(av_packet->flags & AV_PKT_FLAG_KEY)) {
-        BOOST_LOG(error) << "Encoder did not produce IDR frame when requested!"sv;
-      }
+      // syslat: the IDR check moved below, to the point where this packet is matched to the frame that
+      // actually produced it. Comparing against the frame just submitted is only valid when async_depth==1.
 
       if (session.inject) {
         if (session.inject == 1) {
@@ -1901,9 +1930,41 @@ namespace video {
         );
       }
 
-      if (av_packet && av_packet->pts == frame_nr) {
-        packet->frame_timestamp = frame_timestamp;
-        session.syslat_ts_hits++;
+      // syslat: match this packet to the frame that produced it. Lookup by pts is exact whenever the encoder
+      // preserves the pts stamped on the input frame; the fallback is the oldest outstanding frame, which is
+      // correct for an encoder that returns packets in submission order (every hardware encoder here does).
+      // Retiring everything older than a hit also covers frames the encoder dropped internally.
+      {
+        bool matched = false;
+        bool idr_requested = false;
+
+        if (syslat_pkt_pts != AV_NOPTS_VALUE) {
+          if (auto it = session.syslat_pending.find(syslat_pkt_pts); it != session.syslat_pending.end()) {
+            session.syslat_pending.erase(session.syslat_pending.begin(), it);  // older frames were dropped
+            packet->frame_timestamp = it->second.ts;
+            idr_requested = it->second.idr_requested;
+            session.syslat_pending.erase(it);
+            session.syslat_ts_hits++;
+            matched = true;
+          }
+        }
+
+        if (!matched && !session.syslat_pending.empty()) {
+          auto it = session.syslat_pending.begin();
+          packet->frame_timestamp = it->second.ts;
+          idr_requested = it->second.idr_requested;
+          session.syslat_pending.erase(it);
+          session.syslat_ts_fifo++;
+          matched = true;
+        }
+
+        if (!matched) {
+          session.syslat_ts_miss++;
+        }
+
+        if (idr_requested && !(av_packet->flags & AV_PKT_FLAG_KEY)) {
+          BOOST_LOG(error) << "Encoder did not produce IDR frame when requested!"sv;
+        }
       }
 
       packet->replacements = &session.replacements;
@@ -1911,15 +1972,20 @@ namespace video {
       packets->raise(std::move(packet));
 
       // syslat diagnostic: ONE line per encoded packet. send_us is avcodec_send_frame (where the surface
-      // pool blocks at async_depth=1), recv_us is avcodec_receive_packet (waiting on the encoder), and the
-      // ts counter is the fraction of packets that could be matched to the frame just submitted. With
-      // async_depth>1 the guard above can skip a frame; stream.cpp then sends frame_processing_latency=0
-      // and leaves that frame out of the summary, so this ratio MUST be reported or an async_depth A/B
-      // would compare two different populations.
+      // pool blocks at async_depth=1), recv_us is avcodec_receive_packet (waiting on the encoder), behind is
+      // how many frames the returned packet trails the frame just submitted (== the encoder's real pipeline
+      // depth, since we now match by pts instead of by the frame just sent), and in_flight is how many
+      // frames are still outstanding. ts MUST be reported: before the pts matching fix above it collapsed to
+      // 0 % at async_depth>1, stream.cpp then sent frame_processing_latency=0 for every frame, and an
+      // async_depth A/B would silently have compared two different populations.
       session.syslat_pkts++;
       BOOST_LOG(verbose) << "syslat enc frame ["sv << frame_nr << "] send_us ["sv << syslat_send_us
                          << "] recv_us ["sv << syslat_recv_us << "] ts ["sv << session.syslat_ts_hits
-                         << '/' << session.syslat_pkts << ']';
+                         << '/' << session.syslat_pkts << "] fifo ["sv << session.syslat_ts_fifo
+                         << "] miss ["sv << session.syslat_ts_miss << "] drop ["sv
+                         << session.syslat_pending_dropped << "] pkt_pts ["sv << syslat_pkt_pts
+                         << "] behind ["sv << (frame_nr - syslat_pkt_pts) << "] in_flight ["sv
+                         << session.syslat_pending.size() << ']';
     }
 
     return 0;
