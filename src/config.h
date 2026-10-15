@@ -94,6 +94,7 @@ namespace config {
       std::optional<int> qsv_preset;  ///< Intel Quick Sync preset; unset uses the encoder default.
       std::optional<int> qsv_cavlc;  ///< Intel Quick Sync CAVLC selection; unset uses the encoder default.
       bool qsv_slow_hevc;  ///< Whether to enable the slower Intel Quick Sync HEVC path.
+      int qsv_async_depth;  ///< Intel Quick Sync async depth (frames in flight); diagnostic knob, default 1 (upstream hardcodes 1, and >1 changes encoder handshaking).
     } qsv;  ///< Intel Quick Sync encoder options.
 
     struct {

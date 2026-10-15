@@ -538,6 +538,10 @@ namespace video {
 
     // inject sps/vps data into idr pictures
     int inject;  ///< Number of upcoming IDR frames that should receive rewritten parameter sets.
+
+    // syslat diagnostics (see encode_avcodec): timestamp coverage of this session's packets.
+    long long syslat_pkts {0};  ///< Packets raised by encode_avcodec() in this session.
+    long long syslat_ts_hits {0};  ///< Of those, how many could be matched to the frame just submitted.
   };
 
   /**
@@ -877,7 +881,7 @@ namespace video {
       {
         {"preset"s, &config::video.qsv.qsv_preset},
         {"forced_idr"s, 1},
-        {"async_depth"s, 1},
+        {"async_depth"s, &config::video.qsv.qsv_async_depth},
         {"low_delay_brc"s, 1},
         {"low_power"s, 1},
       },
@@ -906,7 +910,7 @@ namespace video {
       {
         {"preset"s, &config::video.qsv.qsv_preset},
         {"forced_idr"s, 1},
-        {"async_depth"s, 1},
+        {"async_depth"s, &config::video.qsv.qsv_async_depth},
         {"low_delay_brc"s, 1},
         {"low_power"s, 1},
         {"recovery_point_sei"s, 0},
@@ -943,7 +947,7 @@ namespace video {
         {"preset"s, &config::video.qsv.qsv_preset},
         {"cavlc"s, &config::video.qsv.qsv_cavlc},
         {"forced_idr"s, 1},
-        {"async_depth"s, 1},
+        {"async_depth"s, &config::video.qsv.qsv_async_depth},
         {"low_delay_brc"s, 1},
         {"low_power"s, 1},
         {"recovery_point_sei"s, 0},
@@ -1833,7 +1837,11 @@ namespace video {
     auto &vps = session.vps;
 
     // send the frame to the encoder
+    // syslat diagnostic: with async_depth=1 this call is where the encoder's surface pool can block.
+    const auto syslat_t_send = std::chrono::steady_clock::now();
     auto ret = avcodec_send_frame(ctx.get(), frame);
+    const auto syslat_send_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - syslat_t_send).count();
     if (ret < 0) {
       char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
       BOOST_LOG(error) << "Could not send a frame for encoding: "sv << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, ret);
@@ -1845,7 +1853,11 @@ namespace video {
       auto packet = std::make_unique<packet_raw_avcodec>();
       auto av_packet = packet.get()->av_packet;
 
+      // syslat diagnostic: recv_us is the wait for the encoder to hand back a finished packet.
+      const auto syslat_t_recv = std::chrono::steady_clock::now();
       ret = avcodec_receive_packet(ctx.get(), av_packet);
+      const auto syslat_recv_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - syslat_t_recv).count();
       if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
         return 0;
       } else if (ret < 0) {
@@ -1856,7 +1868,11 @@ namespace video {
         BOOST_LOG(debug) << "Frame "sv << frame_nr << ": IDR Keyframe (AV_FRAME_FLAG_KEY)"sv;
       }
 
-      if ((frame->flags & AV_FRAME_FLAG_KEY) && !(av_packet->flags & AV_PKT_FLAG_KEY)) {
+      // syslat: only compare flags when this packet really belongs to the frame we just submitted -- with
+      // async_depth>1 the encoder can hand back the previous frame's packet here. This branch only logs,
+      // so the guard is cosmetic, but a false "did not produce IDR" line would mislead exactly the
+      // loss-recovery investigation we are running.
+      if (av_packet->pts == frame_nr && (frame->flags & AV_FRAME_FLAG_KEY) && !(av_packet->flags & AV_PKT_FLAG_KEY)) {
         BOOST_LOG(error) << "Encoder did not produce IDR frame when requested!"sv;
       }
 
@@ -1887,11 +1903,23 @@ namespace video {
 
       if (av_packet && av_packet->pts == frame_nr) {
         packet->frame_timestamp = frame_timestamp;
+        session.syslat_ts_hits++;
       }
 
       packet->replacements = &session.replacements;
       packet->channel_data = channel_data;
       packets->raise(std::move(packet));
+
+      // syslat diagnostic: ONE line per encoded packet. send_us is avcodec_send_frame (where the surface
+      // pool blocks at async_depth=1), recv_us is avcodec_receive_packet (waiting on the encoder), and the
+      // ts counter is the fraction of packets that could be matched to the frame just submitted. With
+      // async_depth>1 the guard above can skip a frame; stream.cpp then sends frame_processing_latency=0
+      // and leaves that frame out of the summary, so this ratio MUST be reported or an async_depth A/B
+      // would compare two different populations.
+      session.syslat_pkts++;
+      BOOST_LOG(verbose) << "syslat enc frame ["sv << frame_nr << "] send_us ["sv << syslat_send_us
+                         << "] recv_us ["sv << syslat_recv_us << "] ts ["sv << session.syslat_ts_hits
+                         << '/' << session.syslat_pkts << ']';
     }
 
     return 0;

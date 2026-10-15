@@ -235,6 +235,13 @@ namespace platf::dxgi {
     };
 
     DXGI_RATIONAL client_frame_rate_adjusted = adjust_client_frame_rate();
+
+    // syslat diagnostic: record what the frame-rate adjustment actually decided. The adjustment can only
+    // DECREASE the requested rate (see the comment inside the lambda above), so without this line we cannot
+    // tell whether "40 fps at a 120 fps request" was the hardware or Sunshine quietly re-targeting us.
+    BOOST_LOG(verbose) << "syslat rate requested ["sv << client_frame_rate << "] adjusted ["
+                       << client_frame_rate_adjusted.Numerator << '/' << client_frame_rate_adjusted.Denominator << ']';
+
     std::optional<std::chrono::steady_clock::time_point> frame_pacing_group_start;
     uint32_t frame_pacing_group_frames = 0;
 
@@ -271,6 +278,9 @@ namespace platf::dxgi {
 
         if (sleep_period <= 0ns) {
           // We missed next frame time, invalidating current frame pacing group
+          BOOST_LOG(verbose) << "syslat group miss sleep_us ["sv
+                             << std::chrono::duration_cast<std::chrono::microseconds>(sleep_period).count()
+                             << "] group_frames ["sv << frame_pacing_group_frames << ']';
           frame_pacing_group_start = std::nullopt;
           frame_pacing_group_frames = 0;
           status = capture_e::timeout;
@@ -281,9 +291,24 @@ namespace platf::dxgi {
 
           status = snapshot(pull_free_image_cb, img_out, 0ms, *cursor);
 
+          // syslat diagnostic: this path deliberately sleeps to the client's frame grid and then takes
+          // whatever frame is ALREADY available (zero timeout). So age_us -- the age of the frame we just
+          // picked up, measured against its own desktop-present timestamp -- is latency Sunshine adds by
+          // design, and it is included in "Frame processing latency" downstream. sleep_us is how much we
+          // slept. ONE line per frame on purpose: several probes per frame would perturb the measurement.
+          if (status == capture_e::ok && img_out && img_out->frame_timestamp) {
+            BOOST_LOG(verbose) << "syslat cap path [pacing0] sleep_us ["sv
+                               << std::chrono::duration_cast<std::chrono::microseconds>(sleep_period).count()
+                               << "] age_us ["sv
+                               << std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - *img_out->frame_timestamp).count()
+                               << "] group_frames ["sv << frame_pacing_group_frames << ']';
+          }
+
           if (status == capture_e::ok && img_out) {
             frame_pacing_group_frames += 1;
           } else {
+            BOOST_LOG(verbose) << "syslat group miss sleep_us [0] group_frames ["sv << frame_pacing_group_frames << ']';
             frame_pacing_group_start = std::nullopt;
             frame_pacing_group_frames = 0;
           }
@@ -293,6 +318,16 @@ namespace platf::dxgi {
       // Start new frame pacing group if necessary, snapshot() is called with non-zero timeout
       if (status == capture_e::timeout || (status == capture_e::ok && !frame_pacing_group_start)) {
         status = snapshot(pull_free_image_cb, img_out, 200ms, *cursor);
+
+        // syslat diagnostic: the blocking path -- we waited (up to 200 ms) for the desktop to present
+        // something new, so age_us here should be small. Comparing age_us between [pacing0] and [block200]
+        // is exactly how we tell whether the grid pacing is what costs us latency at high resolutions.
+        if (status == capture_e::ok && img_out && img_out->frame_timestamp) {
+          BOOST_LOG(verbose) << "syslat cap path [block200] sleep_us [0] age_us ["sv
+                             << std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - *img_out->frame_timestamp).count()
+                             << ']';
+        }
 
         if (status == capture_e::ok && img_out) {
           frame_pacing_group_start = img_out->frame_timestamp;

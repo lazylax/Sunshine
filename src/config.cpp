@@ -737,6 +737,7 @@ namespace config {
       qsv::medium,  // preset
       qsv::_auto,  // cavlc
       false,  // slow_hevc
+      1,  // async_depth (upstream default; see config.h)
     },  // qsv
 
     {
@@ -1637,6 +1638,7 @@ namespace config {
     int_f(vars, "qsv_preset", video.qsv.qsv_preset, qsv::preset_from_view);
     int_f(vars, "qsv_coder", video.qsv.qsv_cavlc, qsv::coder_from_view);
     bool_f(vars, "qsv_slow_hevc", video.qsv.qsv_slow_hevc);
+    int_f(vars, "qsv_async_depth", video.qsv.qsv_async_depth);
 
     std::string quality;
     string_f(vars, "amd_quality", quality);
