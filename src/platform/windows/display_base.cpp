@@ -223,6 +223,7 @@ namespace platf::dxgi {
   }
 
   capture_e display_base_t::capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) {
+    BOOST_LOG(info) << "syslat CAPTURE-FN-ENTER";  // [DIAG] first line probe
     BOOST_LOG(info) << "syslat capture() entered: frame_rate [" << client_frame_rate
                      << "] display_rounded [" << display_refresh_rate_rounded << ']';
     auto adjust_client_frame_rate = [&]() -> DXGI_RATIONAL {
