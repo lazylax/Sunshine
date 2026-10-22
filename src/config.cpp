@@ -739,6 +739,7 @@ namespace config {
       qsv::medium,  // preset
       qsv::_auto,  // cavlc
       false,  // slow_hevc
+      1,  // async_depth (upstream default; see config.h)
     },  // qsv
 
     {
@@ -1613,6 +1614,9 @@ namespace config {
     int_between_f(vars, "hevc_mode", video.hevc_mode, {0, 3});
     int_between_f(vars, "av1_mode", video.av1_mode, {0, 3});
     int_f(vars, "min_threads", video.min_threads);
+      int_f(vars, "capture_pacing_offset_us", video.capture_pacing_offset_us);
+      int_f(vars, "capture_pacing_snapshot_timeout_us", video.capture_pacing_snapshot_timeout_us);
+      int_f(vars, "capture_pacing_offset_integer_only", video.capture_pacing_offset_integer_only);
     string_f(vars, "sw_preset", video.sw.sw_preset);
     if (!video.sw.sw_preset.empty()) {
       video.sw.svtav1_preset = sw::svtav1_preset_from_view(video.sw.sw_preset);
@@ -1642,6 +1646,7 @@ namespace config {
     int_f(vars, "qsv_preset", video.qsv.qsv_preset, qsv::preset_from_view);
     int_f(vars, "qsv_coder", video.qsv.qsv_cavlc, qsv::coder_from_view);
     bool_f(vars, "qsv_slow_hevc", video.qsv.qsv_slow_hevc);
+    int_f(vars, "qsv_async_depth", video.qsv.qsv_async_depth);
 
     std::string quality;
     string_f(vars, "amd_quality", quality);

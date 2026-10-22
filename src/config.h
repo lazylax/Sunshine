@@ -101,6 +101,7 @@ namespace config {
       std::optional<int> qsv_preset;  ///< Intel Quick Sync preset; unset uses the encoder default.
       std::optional<int> qsv_cavlc;  ///< Intel Quick Sync CAVLC selection; unset uses the encoder default.
       bool qsv_slow_hevc;  ///< Whether to enable the slower Intel Quick Sync HEVC path.
+      int qsv_async_depth;  ///< Intel Quick Sync async depth (frames in flight); diagnostic knob, default 1 (upstream hardcodes 1, and >1 changes encoder handshaking).
     } qsv;  ///< Intel Quick Sync encoder options.
 
     struct {
@@ -229,6 +230,16 @@ namespace config {
     dd_t dd;  ///< Display-device integration settings.
 
     int max_bitrate;  ///< Maximum bitrate ceiling in kbps for bitrate requested from the client.
+    
+    // [DIAG] Capture pacing offset (see display_base.cpp). 0 = disabled.
+    int capture_pacing_offset_us;
+    // [DIAG] Small timeout (us) for the zero-timeout snapshot in the pacing-group path.
+    // 0 = current behaviour (0 ms poll).
+    int capture_pacing_snapshot_timeout_us;
+    // [DIAG] Option A scope: 1 = apply the pacing offset only when target fps and display
+    // refresh rate are in an integer ratio (phase-locked). 0 = also apply when the target is
+    // lower than the display refresh rate but the ratio is not integral.
+    int capture_pacing_offset_integer_only;
     double minimum_fps_target;  ///< Lowest framerate that will be used when streaming. Range 0-1000, 0 = half of client's requested framerate.
   };
 

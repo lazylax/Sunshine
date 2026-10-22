@@ -260,7 +260,15 @@ namespace platf::dxgi {
       if (_locked) {
         return true;
       }
+      const auto syslat_t_lock = std::chrono::steady_clock::now();
       HRESULT status = _mutex->AcquireSync(0, INFINITE);
+      // syslat diagnostic: an INFINITE-timeout keyed-mutex acquire on a shared capture texture -- i.e. a
+      // capture-thread <-> encoder-thread handshake that was previously assumed to be free. It can block
+      // for an unbounded time, and that wait is NOT visible in any of Sunshine's existing latency numbers.
+      BOOST_LOG(verbose) << "syslat lock tex_us ["sv
+                         << std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - syslat_t_lock).count()
+                         << ']';
       if (status == S_OK) {
         _locked = true;
       } else {
@@ -511,7 +519,10 @@ namespace platf::dxgi {
         }
 
         // Acquire encoder mutex to synchronize with capture code
+        const auto syslat_t_enc = std::chrono::steady_clock::now();
         auto status = img_ctx.encoder_mutex->AcquireSync(0, INFINITE);
+        const auto syslat_lock_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - syslat_t_enc).count();
         if (status != S_OK) {
           BOOST_LOG(error) << "Failed to acquire encoder mutex [0x"sv << util::hex(status).to_string_view() << ']';
           return -1;
@@ -554,6 +565,15 @@ namespace platf::dxgi {
 
         // Release encoder mutex to allow capture code to reuse this image
         img_ctx.encoder_mutex->ReleaseSync(0);
+
+        // syslat diagnostic: lock_us = the INFINITE-timeout encoder-mutex wait (the capture<->encode
+        // handshake, previously assumed to be free); submit_us = CPU time issuing the conversion draws.
+        // NOTE: the GPU time behind those draws is NOT visible here -- read it from the guest's WDDM
+        // engine counters instead (they showed engtype_3D at only ~16% duty at 4K24).
+        BOOST_LOG(verbose) << "syslat convert lock_us ["sv << syslat_lock_us << "] submit_us ["sv
+                           << std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - syslat_t_enc).count()
+                           << ']';
 
         ID3D11ShaderResourceView *emptyShaderResourceView = nullptr;
         device_ctx->PSSetShaderResources(0, 1, &emptyShaderResourceView);
@@ -1368,7 +1388,15 @@ namespace platf::dxgi {
     DXGI_OUTDUPL_FRAME_INFO frame_info;
 
     resource_t::pointer res_p {};
+    const auto syslat_t_next = std::chrono::steady_clock::now();
     auto capture_status = dup.next_frame(frame_info, timeout, &res_p);
+    // syslat diagnostic: the blocking AcquireNextFrame wait -- timeout is 0ms when called from the pacing
+    // path and 200ms from the blocking path, so the ok/timeout ratio here is also our "is the desktop
+    // presenting on demand" probe. Logged on timeout too on purpose.
+    BOOST_LOG(verbose) << "syslat snapshot wait_us ["sv
+                       << std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::steady_clock::now() - syslat_t_next).count()
+                       << "] timeout_ms ["sv << timeout.count() << "] status ["sv << (int) capture_status << ']';
     resource_t res {res_p};
 
     if (capture_status != capture_e::ok) {

@@ -248,6 +248,48 @@ namespace platf::dxgi {
     };
 
     DXGI_RATIONAL client_frame_rate_adjusted = adjust_client_frame_rate();
+    // [DIAG] Capture pacing offset: when the client's target fps is an integer divisor or
+    // multiple of the display refresh rate, the capture grid locks to the display's present
+    // phase, so every capture lands exactly AT the present moment. The new frame is only
+    // retrievable slightly AFTER that moment, so the 0 ms snapshot poll misses it. Adding a
+    // small offset (fraction of one frame, capped) pushes the capture past the present.
+    const bool pacing_integer_ratio =
+      (display_refresh_rate_rounded > 0 && client_frame_rate > 0) &&
+      ((client_frame_rate % display_refresh_rate_rounded == 0) ||
+       (display_refresh_rate_rounded % client_frame_rate == 0));
+const bool pacing_offset_allowed =
+      (config::video.capture_pacing_offset_integer_only == 0)
+        ? (client_frame_rate > 0 && display_refresh_rate_rounded > 0 &&
+           client_frame_rate <= display_refresh_rate_rounded)
+        : pacing_integer_ratio;
+    const auto pacing_offset_ns = [&]() -> std::chrono::nanoseconds {
+      const int cfg_us = config::video.capture_pacing_offset_us;
+      if (cfg_us <= 0 || !pacing_offset_allowed) {
+        return 0ns;
+      }
+      const auto frame_period_ns = std::chrono::nanoseconds(1s) *
+                                   client_frame_rate_adjusted.Denominator /
+                                   client_frame_rate_adjusted.Numerator;
+      const auto cap_ns = frame_period_ns / 8;
+      const auto want_ns = std::chrono::nanoseconds(cfg_us) * 1000;
+      return want_ns < cap_ns ? want_ns : cap_ns;
+    }();
+    static bool pacing_offset_logged = false;
+    if (!pacing_offset_logged) {
+      pacing_offset_logged = true;
+      BOOST_LOG(info) << "syslat pacing offset integer_ratio [" << pacing_integer_ratio
+                       << "] allowed [" << pacing_offset_allowed << "] cfg_us [" << config::video.capture_pacing_offset_us
+                       << "] applied_us ["
+                       << std::chrono::duration_cast<std::chrono::microseconds>(pacing_offset_ns).count()
+                         << ']';
+    }
+
+    // syslat diagnostic: record what the frame-rate adjustment actually decided. The adjustment can only
+    // DECREASE the requested rate (see the comment inside the lambda above), so without this line we cannot
+    // tell whether "40 fps at a 120 fps request" was the hardware or Sunshine quietly re-targeting us.
+    BOOST_LOG(verbose) << "syslat rate requested ["sv << client_frame_rate << "] adjusted ["
+                       << client_frame_rate_adjusted.Numerator << '/' << client_frame_rate_adjusted.Denominator << ']';
+
     std::optional<std::chrono::steady_clock::time_point> frame_pacing_group_start;
     uint32_t frame_pacing_group_frames = 0;
 
@@ -277,13 +319,17 @@ namespace platf::dxgi {
       if (frame_pacing_group_start) {
         const uint32_t seconds = (uint64_t) frame_pacing_group_frames * client_frame_rate_adjusted.Denominator / client_frame_rate_adjusted.Numerator;
         const uint32_t remainder = (uint64_t) frame_pacing_group_frames * client_frame_rate_adjusted.Denominator % client_frame_rate_adjusted.Numerator;
-        const auto sleep_target = *frame_pacing_group_start +
+        auto sleep_target = *frame_pacing_group_start +
                                   std::chrono::nanoseconds(1s) * seconds +
                                   std::chrono::nanoseconds(1s) * remainder / client_frame_rate_adjusted.Numerator;
+        sleep_target += pacing_offset_ns;  // [DIAG] push capture past the present
         const auto sleep_period = sleep_target - std::chrono::steady_clock::now();
 
         if (sleep_period <= 0ns) {
           // We missed next frame time, invalidating current frame pacing group
+          BOOST_LOG(verbose) << "syslat group miss sleep_us ["sv
+                             << std::chrono::duration_cast<std::chrono::microseconds>(sleep_period).count()
+                             << "] group_frames ["sv << frame_pacing_group_frames << ']';
           frame_pacing_group_start = std::nullopt;
           frame_pacing_group_frames = 0;
           status = capture_e::timeout;
@@ -292,11 +338,31 @@ namespace platf::dxgi {
           sleep_overshoot_logger.first_point(sleep_target);
           sleep_overshoot_logger.second_point_now_and_log();
 
-          status = snapshot(pull_free_image_cb, img_out, 0ms, *cursor);
+          // [DIAG] Option C: give the pacing-path snapshot a small timeout so a frame that
+          // becomes available just after the sleep target is still picked up.
+          const int snap_to_us = config::video.capture_pacing_snapshot_timeout_us;
+          const auto snap_timeout = snap_to_us > 0 ? std::chrono::microseconds(snap_to_us)
+                                                  : std::chrono::milliseconds(0);
+          status = snapshot(pull_free_image_cb, img_out, snap_timeout, *cursor);
+
+          // syslat diagnostic: this path deliberately sleeps to the client's frame grid and then takes
+          // whatever frame is ALREADY available (zero timeout). So age_us -- the age of the frame we just
+          // picked up, measured against its own desktop-present timestamp -- is latency Sunshine adds by
+          // design, and it is included in "Frame processing latency" downstream. sleep_us is how much we
+          // slept. ONE line per frame on purpose: several probes per frame would perturb the measurement.
+          if (status == capture_e::ok && img_out && img_out->frame_timestamp) {
+            BOOST_LOG(verbose) << "syslat cap path [pacing0] sleep_us ["sv
+                               << std::chrono::duration_cast<std::chrono::microseconds>(sleep_period).count()
+                               << "] age_us ["sv
+                               << std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - *img_out->frame_timestamp).count()
+                               << "] group_frames ["sv << frame_pacing_group_frames << ']';
+          }
 
           if (status == capture_e::ok && img_out) {
             frame_pacing_group_frames += 1;
           } else {
+            BOOST_LOG(verbose) << "syslat group miss sleep_us [0] group_frames ["sv << frame_pacing_group_frames << ']';
             frame_pacing_group_start = std::nullopt;
             frame_pacing_group_frames = 0;
           }
@@ -306,6 +372,16 @@ namespace platf::dxgi {
       // Start new frame pacing group if necessary, snapshot() is called with non-zero timeout
       if (status == capture_e::timeout || (status == capture_e::ok && !frame_pacing_group_start)) {
         status = snapshot(pull_free_image_cb, img_out, 200ms, *cursor);
+
+        // syslat diagnostic: the blocking path -- we waited (up to 200 ms) for the desktop to present
+        // something new, so age_us here should be small. Comparing age_us between [pacing0] and [block200]
+        // is exactly how we tell whether the grid pacing is what costs us latency at high resolutions.
+        if (status == capture_e::ok && img_out && img_out->frame_timestamp) {
+          BOOST_LOG(verbose) << "syslat cap path [block200] sleep_us [0] age_us ["sv
+                             << std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - *img_out->frame_timestamp).count()
+                             << ']';
+        }
 
         if (status == capture_e::ok && img_out) {
           frame_pacing_group_start = img_out->frame_timestamp;
