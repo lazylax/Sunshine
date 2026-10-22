@@ -337,7 +337,17 @@ const bool pacing_offset_allowed =
           frame_pacing_group_frames = 0;
           status = capture_e::timeout;
         } else {
-          timer->sleep_for(sleep_period);
+          // [DIAG] Sleep to just before the target, then spin-wait to hit the present precisely.
+          // The waitable timer overshoots by a few ms, which at a 1:1 display:client ratio is
+          // enough to miss the frame we are waiting for. Spinning the last millimetre costs a
+          // little CPU but lands the capture much closer to the requested instant.
+          const auto spin_lead = std::chrono::milliseconds(1);
+          if (sleep_period > spin_lead) {
+            timer->sleep_for(sleep_period - spin_lead);
+          }
+          while (std::chrono::steady_clock::now() < sleep_target) {
+            ::YieldProcessor();
+          }
           sleep_overshoot_logger.first_point(sleep_target);
           sleep_overshoot_logger.second_point_now_and_log();
 
