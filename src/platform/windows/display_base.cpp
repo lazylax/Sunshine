@@ -223,6 +223,8 @@ namespace platf::dxgi {
   }
 
   capture_e display_base_t::capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) {
+    BOOST_LOG(info) << "syslat capture() entered: frame_rate [" << client_frame_rate
+                     << "] display_rounded [" << display_refresh_rate_rounded << ']';
     auto adjust_client_frame_rate = [&]() -> DXGI_RATIONAL {
       // Use exactly the requested rate if the client sent an X100 value
       if (client_frame_rate_strict.Numerator > 0) {
