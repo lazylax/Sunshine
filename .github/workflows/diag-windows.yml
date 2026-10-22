@@ -1,0 +1,36 @@
+# Diagnostic Windows-only build for the guest-side streaming latency investigation.
+#
+# WHY a separate workflow instead of just running ci.yml:
+#   * ci.yml has no repository guard on most jobs, so in a fork it also spins up Docker / FreeBSD /
+#     Homebrew / macOS / Linux / Arch / Alpine / Copr / Flatpak / PowerShell / Web-UI, of which the ones
+#     needing secrets (Docker Hub, Copr, Apple notarization) are guaranteed to fail. They do not block
+#     build-windows' artifact, but they are slow and noisy.
+#   * build-windows has "needs: release-setup", and release-setup calls
+#     LizardByte/actions/actions/release_setup -- the one piece we could not verify works in a fork.
+#     ci-windows.yml declares workflow_call, so calling it directly skips release-setup entirely.
+#
+# Trigger is push-to-diag and workflow_dispatch only, so this fork's master is never touched and ci.yml's
+# own push trigger (branches: [master]) never fires. Nothing else in this repo is affected.
+name: diag-windows-only
+
+on:
+  push:
+    branches:
+      - diag
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  build-windows:
+    name: Windows
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci-windows.yml
+    with:
+      # 'false' keeps every code-signing step switched off: they are guarded on
+      # publish_release == 'true' && azure_signing_account != '', and a fork has no AZURE_SIGNING_* vars,
+      # so no secrets are required anywhere in this build.
+      publish_release: 'false'
+      release_commit: ${{ github.sha }}
+      release_version: '0.0.0-pacing'
