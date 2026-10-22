@@ -341,7 +341,7 @@ const bool pacing_offset_allowed =
           // [DIAG] Option C: give the pacing-path snapshot a small timeout so a frame that
           // becomes available just after the sleep target is still picked up.
           const int snap_to_us = config::video.capture_pacing_snapshot_timeout_us;
-          const auto snap_timeout = std::chrono::microseconds(snap_to_us > 0 ? snap_to_us : 0);
+          const auto snap_timeout = std::chrono::milliseconds(snap_to_us > 0 ? (snap_to_us + 999) / 1000 : 0);
           status = snapshot(pull_free_image_cb, img_out, snap_timeout, *cursor);
 
           // syslat diagnostic: this path deliberately sleeps to the client's frame grid and then takes
